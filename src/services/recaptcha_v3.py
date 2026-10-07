@@ -123,54 +123,75 @@ class RecaptchaV3Solver:
         page = await context.new_page()
         await page.add_init_script(_STEALTH_JS)
 
+        # Diagnostics: main-frame navigations and navigations we blocked
+        navigations: list[str] = []
+        blocked: list[str] = []
+        page.on(
+            "framenavigated",
+            lambda frame: navigations.append(frame.url)
+            if frame == page.main_frame
+            else None,
+        )
+
         try:
-            timeout_ms = self._config.browser_timeout * 1000
-            await page.goto(
-                website_url, wait_until="networkidle", timeout=timeout_ms
-            )
-
-            # Some pages reload themselves (e.g. location.reload() after their
-            # own score check), which destroys the JS context mid-evaluate.
-            # Once loaded, abort any further main-frame navigation; ERR_ABORTED
-            # keeps the current document alive instead of showing an error page.
-            async def _block_navigation(route):
-                request = route.request
-                if request.is_navigation_request() and request.frame == page.main_frame:
-                    await route.abort("aborted")
-                else:
-                    await route.continue_()
-
-            await page.route("**/*", _block_navigation)
-
-            # Simulate minimal human-like behaviour to improve score
-            await page.mouse.move(400, 300)
-            await asyncio.sleep(1)
-            await page.mouse.move(600, 400)
-            await asyncio.sleep(0.5)
-
-            # Wait for reCAPTCHA to become available (may already be on page)
-            try:
-                await page.wait_for_function(
-                    "(typeof grecaptcha !== 'undefined' && typeof grecaptcha.execute === 'function') "
-                    "|| (typeof grecaptcha !== 'undefined' && typeof grecaptcha?.enterprise?.execute === 'function')",
-                    timeout=10_000,
-                )
-            except Exception:
-                log.info(
-                    "grecaptcha not detected on page, will attempt script injection"
-                )
-
-            token = await self._evaluate_execute(page, website_key, page_action)
-
-            if not isinstance(token, str) or len(token) < 20:
-                raise RuntimeError(f"Invalid token received: {token!r}")
-
-            log.info(
-                "Got reCAPTCHA token for %s (len=%d)", website_url, len(token)
-            )
-            return token
+            return await self._run(page, website_url, website_key, page_action, blocked)
+        except Exception as exc:
+            raise RuntimeError(
+                f"{exc} [navigations={navigations[-6:]} blocked={blocked[-6:]}]"
+            ) from exc
         finally:
             await context.close()
+
+    async def _run(
+        self, page, website_url: str, website_key: str, page_action: str,
+        blocked: list[str],
+    ) -> str:
+        timeout_ms = self._config.browser_timeout * 1000
+        await page.goto(
+            website_url, wait_until="networkidle", timeout=timeout_ms
+        )
+
+        # Some pages reload themselves (e.g. location.reload() after their
+        # own score check), which destroys the JS context mid-evaluate.
+        # Once loaded, abort any further main-frame navigation; ERR_ABORTED
+        # keeps the current document alive instead of showing an error page.
+        async def _block_navigation(route):
+            request = route.request
+            if request.is_navigation_request() and request.frame == page.main_frame:
+                blocked.append(request.url)
+                await route.abort("aborted")
+            else:
+                await route.continue_()
+
+        await page.route("**/*", _block_navigation)
+
+        # Simulate minimal human-like behaviour to improve score
+        await page.mouse.move(400, 300)
+        await asyncio.sleep(1)
+        await page.mouse.move(600, 400)
+        await asyncio.sleep(0.5)
+
+        # Wait for reCAPTCHA to become available (may already be on page)
+        try:
+            await page.wait_for_function(
+                "(typeof grecaptcha !== 'undefined' && typeof grecaptcha.execute === 'function') "
+                "|| (typeof grecaptcha !== 'undefined' && typeof grecaptcha?.enterprise?.execute === 'function')",
+                timeout=10_000,
+            )
+        except Exception:
+            log.info(
+                "grecaptcha not detected on page, will attempt script injection"
+            )
+
+        token = await self._evaluate_execute(page, website_key, page_action)
+
+        if not isinstance(token, str) or len(token) < 20:
+            raise RuntimeError(f"Invalid token received: {token!r}")
+
+        log.info(
+            "Got reCAPTCHA token for %s (len=%d)", website_url, len(token)
+        )
+        return token
 
     @staticmethod
     async def _evaluate_execute(page, website_key: str, page_action: str) -> Any:
