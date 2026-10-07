@@ -147,41 +147,39 @@ class RecaptchaV3Solver:
         blocked: list[str],
     ) -> str:
         timeout_ms = self._config.browser_timeout * 1000
-        await page.goto(
-            website_url, wait_until="networkidle", timeout=timeout_ms
-        )
 
-        # Some pages reload themselves (e.g. location.reload() after their
-        # own score check), which destroys the JS context mid-evaluate.
-        # Once loaded, abort any further main-frame navigation; ERR_ABORTED
-        # keeps the current document alive instead of showing an error page.
-        async def _block_navigation(route):
+        # Serve a blank document for the initial websiteURL navigation instead
+        # of the real page.
+        # reCAPTCHA only checks the origin, and without the site's own scripts
+        # nothing can reload or redirect the page mid-execute (e.g. antcpt.com
+        # calls location.reload() after its own score check). Any other
+        # main-frame navigation is aborted.
+        served = False
+
+        async def _serve_blank(route):
+            nonlocal served
             request = route.request
-            if request.is_navigation_request() and request.frame == page.main_frame:
+            if not (request.is_navigation_request() and request.frame == page.main_frame):
+                await route.continue_()
+            elif not served:
+                served = True
+                await route.fulfill(
+                    status=200,
+                    content_type="text/html",
+                    body="<!doctype html><html><head><title></title></head><body></body></html>",
+                )
+            else:
                 blocked.append(request.url)
                 await route.abort("aborted")
-            else:
-                await route.continue_()
 
-        await page.route("**/*", _block_navigation)
+        await page.route("**/*", _serve_blank)
+        await page.goto(website_url, wait_until="load", timeout=timeout_ms)
 
         # Simulate minimal human-like behaviour to improve score
         await page.mouse.move(400, 300)
         await asyncio.sleep(1)
         await page.mouse.move(600, 400)
         await asyncio.sleep(0.5)
-
-        # Wait for reCAPTCHA to become available (may already be on page)
-        try:
-            await page.wait_for_function(
-                "(typeof grecaptcha !== 'undefined' && typeof grecaptcha.execute === 'function') "
-                "|| (typeof grecaptcha !== 'undefined' && typeof grecaptcha?.enterprise?.execute === 'function')",
-                timeout=10_000,
-            )
-        except Exception:
-            log.info(
-                "grecaptcha not detected on page, will attempt script injection"
-            )
 
         token = await self._evaluate_execute(page, website_key, page_action)
 
