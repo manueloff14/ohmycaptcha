@@ -129,6 +129,19 @@ class RecaptchaV3Solver:
                 website_url, wait_until="networkidle", timeout=timeout_ms
             )
 
+            # Some pages reload themselves (e.g. location.reload() after their
+            # own score check), which destroys the JS context mid-evaluate.
+            # Once loaded, abort any further main-frame navigation; ERR_ABORTED
+            # keeps the current document alive instead of showing an error page.
+            async def _block_navigation(route):
+                request = route.request
+                if request.is_navigation_request() and request.frame == page.main_frame:
+                    await route.abort("aborted")
+                else:
+                    await route.continue_()
+
+            await page.route("**/*", _block_navigation)
+
             # Simulate minimal human-like behaviour to improve score
             await page.mouse.move(400, 300)
             await asyncio.sleep(1)
@@ -147,7 +160,7 @@ class RecaptchaV3Solver:
                     "grecaptcha not detected on page, will attempt script injection"
                 )
 
-            token = await page.evaluate(_EXECUTE_JS, [website_key, page_action])
+            token = await self._evaluate_execute(page, website_key, page_action)
 
             if not isinstance(token, str) or len(token) < 20:
                 raise RuntimeError(f"Invalid token received: {token!r}")
@@ -158,3 +171,15 @@ class RecaptchaV3Solver:
             return token
         finally:
             await context.close()
+
+    @staticmethod
+    async def _evaluate_execute(page, website_key: str, page_action: str) -> Any:
+        """Run _EXECUTE_JS, retrying if a navigation destroys the JS context."""
+        for attempt in range(3):
+            try:
+                return await page.evaluate(_EXECUTE_JS, [website_key, page_action])
+            except Exception as exc:
+                if "Execution context was destroyed" not in str(exc) or attempt == 2:
+                    raise
+                log.info("Page navigated during evaluate, retrying after load")
+                await page.wait_for_load_state("load")
